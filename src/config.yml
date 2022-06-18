@@ -1,0 +1,36 @@
+output_directory: ../results
+model_name: EDC_VAE
+model_params:
+  hidden_size: 32
+  emb_size: 32
+  clf_hidden_1: 0
+  clf_hidden_2: 0
+  dropout: 0.2
+optim_params:
+  lr: 0.002
+  l2_reg: 0.001
+hyperparameters:
+  ll_loss: 0.0001
+  kl_loss: 0.001
+dataset_path: ../dataset/ABIDE/meta.csv
+dataset_name: ABIDE
+seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+num_fold: 5
+ssl: true
+harmonize: true
+labeled_sites: NYU
+device: 2
+verbose: true
+max_epoch: 1000
+patience: 1000
+save_model: true

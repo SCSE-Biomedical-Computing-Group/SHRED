@@ -1,0 +1,1 @@
+For `hyperparameters__ch_loss_accuracy_boxplot.png`, 1.0 was used instead as the number of samples for 0.001 was too low (4).
