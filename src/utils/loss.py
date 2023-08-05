@@ -22,3 +22,15 @@ def kl_divergence_loss(
     kl = 0.5 * (var2.log() - var1.log() + (var1 + (mu1 - mu2) ** 2) / var2 - 1)
     kl = kl.sum(dim=1)
     return reduce(kl, reduction)
+
+
+def entropy_loss(
+    pred_y: torch.Tensor, reduction: str = "mean",
+) -> torch.Tensor:
+    eps = 1e-12
+    pred_y = torch.maximum(pred_y, torch.tensor(eps))
+    uni_dist = torch.ones(pred_y.size(0), device=pred_y.device) / pred_y.size(1)
+    max_entropy = -uni_dist.log()
+    entropy = -pred_y * pred_y.log()
+    entropy = entropy.sum(dim=1)
+    return reduce(max_entropy - entropy, reduction=reduction)

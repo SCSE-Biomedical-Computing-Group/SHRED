@@ -1,6 +1,13 @@
 from __future__ import annotations
-from abc import abstractmethod
-from typing import Sequence, Optional, Dict, Any
+from typing import OrderedDict, Sequence, Optional, Tuple, Dict, Any
+from abc import ABC, abstractmethod
+
+import numpy as np
+from captum.attr import IntegratedGradients
+from scipy.spatial.distance import squareform
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 import torch
 from torch_geometric.data import Data
@@ -83,7 +90,114 @@ class VariationalDecoder(Module):
         return mu, std
 
 
-class ModelBase(Module):
+class SaliencyScoreForward(ABC):
+    @abstractmethod
+    def ss_forward(self, *args) -> torch.Tensor:
+        raise NotImplementedError
+
+    def get_baselines_inputs(
+        self, data: Data
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x: torch.Tensor = data.x
+        y: torch.Tensor = data.y
+        baselines = x[y == 0].mean(dim=0).view(1, -1)
+        inputs = x[y == 1]
+        return baselines, inputs
+
+    def saliency_score(self, data: Data) -> torch.Tensor:
+        baselines, inputs = self.get_baselines_inputs(data)
+        ig = IntegratedGradients(self.ss_forward, True)
+        scores: torch.Tensor = ig.attribute(
+            inputs=inputs, baselines=baselines, target=1
+        )
+
+        scores = scores.detach().cpu().numpy()
+        print(scores[0].shape)
+        scores = np.array([squareform(score) for score in scores])
+        return scores
+
+class LatentSpaceEncoding(ABC):
+    @abstractmethod
+    def ls_forward(self, data: Data) -> torch.Tensor:
+        """
+        return z
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def is_forward(self, data: Data) -> torch.Tensor:
+        """
+        return z
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_surface(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        return y value for each z
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_input_surface(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        return y value for each x
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def _prepare_grid(
+        x: np.ndarray, pipeline: Pipeline, grid_points_dist: float = 0.1
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
+        min1, max1 = x[:, 0].min() - 1, x[:, 0].max() + 1
+        min2, max2 = x[:, 1].min() - 1, x[:, 1].max() + 1
+        x1grid = np.arange(min1, max1, grid_points_dist)
+        x2grid = np.arange(min2, max2, grid_points_dist)
+        xx, yy = np.meshgrid(x1grid, x2grid)
+        r1, r2 = xx.flatten(), yy.flatten()
+        r1, r2 = r1.reshape((len(r1), 1)), r2.reshape((len(r2), 1))
+        grid_xt = np.hstack((r1, r2))
+        emb_grid = pipeline.inverse_transform(grid_xt)
+        return (xx, yy), emb_grid
+
+    def get_latent_space_encoding(self, data: Data) -> Dict[str, np.ndarray]:
+        self.eval()
+        with torch.no_grad():
+            z = self.ls_forward(data).detach().numpy()
+            pipeline = make_pipeline(StandardScaler(), TruncatedSVD(2, random_state=0))
+            x = pipeline.fit_transform(z)
+
+            surface, emb_grid = self._prepare_grid(x, pipeline)
+            emb_grid = torch.tensor(emb_grid, dtype=data.x.dtype)
+            zz: np.ndarray = self.get_surface(emb_grid)[:, 1].detach().numpy()
+
+            xx: np.ndarray = surface[0]
+            yy: np.ndarray = surface[1]
+            zz = zz.reshape(xx.shape)
+        return {"x": x, "xx": xx, "yy": yy, "zz": zz}
+
+    def get_input_space_encoding(self, data: Data) -> Dict[str, np.ndarray]:
+        self.eval()
+        with torch.no_grad():
+            x = self.is_forward(data).detach().numpy()
+            pipeline = make_pipeline(StandardScaler(), PCA(2, random_state=0))
+            x = pipeline.fit_transform(x)
+
+            surface, emb_grid = self._prepare_grid(
+                x, pipeline, grid_points_dist=1.5
+            )
+            emb_grid = torch.tensor(emb_grid, dtype=data.x.dtype)
+            zz: np.ndarray = self.get_input_surface(emb_grid)[
+                :, 1
+            ].detach().numpy()
+
+            xx: np.ndarray = surface[0]
+            yy: np.ndarray = surface[1]
+            zz = zz.reshape(xx.shape)
+        return {"x": x, "xx": xx, "yy": yy, "zz": zz}
+
+
+class ModelBase(Module, SaliencyScoreForward):
     def __init__(self):
         super().__init__()
 
@@ -94,6 +208,20 @@ class ModelBase(Module):
             weight_decay=param.get("l2_reg", 0.0),
         )
         return optim
+
+    @classmethod
+    def load_from_state_dict(
+        cls,
+        path: str,
+        model_params: Dict[str, Any],
+        device: torch.device = torch.device("cpu"),
+    ) -> ModelBase:
+        state_dict: OrderedDict[str, torch.Tensor] = torch.load(
+            path, map_location=device
+        )
+        model = cls(**model_params)
+        model.load_state_dict(state_dict)
+        return model
 
     @abstractmethod
     def train_step(

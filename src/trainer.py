@@ -1,27 +1,20 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import os
 import json
 import time
 import copy
 import logging
-import pandas as pd
 import numpy as np
 import torch
 from torch_geometric.data import Data
 
-from data import Dataset
-from models.EDC_VAE import EDC_VAE
-from utils.misc import (
-    get_device,
-    get_pbar,
-    mkdir,
-    on_error,
-    seed_torch,
-    count_parameters,
-)
+from data import DataloaderBase, Dataset
+from factory import SingleStageFrameworkFactory
+from models import count_parameters
+from utils import get_device, get_pbar, mkdir, seed_torch
 
 
 @dataclass(frozen=True)
@@ -31,62 +24,73 @@ class TrainerParams:
     model_params: Dict[str, Any]
     optim_params: Dict[str, Any]
     hyperparameters: Dict[str, Any]
-    dataset_path: str
-    dataset_name: str
-    seeds: Sequence[int]
-    num_fold: int
+    dataset: Dataset
+    seed: int
+    fold: int
     ssl: bool
     harmonize: bool
+    validation: bool
     labeled_sites: Optional[Union[str, Sequence[str]]] = field(default=None)
+    unlabeled_sites: Optional[Union[str, Sequence[str]]] = field(default=None)
+    num_unlabeled: Optional[int] = field(default=None)
     device: int = field(default=-1)
     verbose: bool = field(default=False)
     patience: int = field(default=np.inf)
     max_epoch: int = field(default=1000)
     save_model: bool = field(default=False)
-    time_id: bool = field(init=False, default_factory=lambda: int(time.time()))
+    dataloader_num_process: int = 1
+    time_id: bool = field(init=False, default_factory=lambda: int(time.strftime('%Y%m%d%H%M%S',time.localtime(time.time())) + str(time.time()).split('.')[-1][:3])) # int(time.time()))
 
-    @property
-    def dataset(self) -> Dataset:
-        return Dataset(self.dataset_path, self.dataset_name, self.harmonize)
-
-    def to_dict(self, seed: int, fold: int) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "model_name": self.model_name,
             "model_params": str(self.model_params),
             "optim_params": str(self.optim_params),
             "hyperparameters": str(self.hyperparameters),
-            "dataset": self.dataset_name,
-            "seed": seed,
-            "fold": fold,
+            "dataset": self.dataset.value,
+            "seed": self.seed,
+            "fold": self.fold,
             "ssl": self.ssl,
             "harmonize": self.harmonize,
+            "validation": self.validation,
             "labeled_sites": self.labeled_sites,
+            "unlabeled_sites": self.unlabeled_sites,
             "device": self.device,
-            "epochs_log_path": self.epochs_log_path(seed, fold),
+            "epochs_log_path": self.epochs_log_path,
         }
 
-    def model_path(self, seed: int, fold: int) -> str:
+    @property
+    def model_path(self):
         return os.path.join(
             os.path.abspath(self.output_directory),
             "models",
             "{}_{}_{}_{}_{}.pt".format(
-                self.dataset_name, self.model_name, seed, fold, self.time_id,
+                self.dataset.value,
+                self.model_name,
+                self.seed,
+                self.fold,
+                self.time_id,
             ),
         )
 
-    def epochs_log_path(self, seed: int, fold: int) -> str:
+    @property
+    def epochs_log_path(self):
         return os.path.join(
             os.path.abspath(self.output_directory),
             "epochs_log",
             "{}_{}_{}_{}_{}.log".format(
-                self.dataset_name, self.model_name, seed, fold, self.time_id,
+                self.dataset.value,
+                self.model_name,
+                self.seed,
+                self.fold,
+                self.time_id,
             ),
         )
 
 
 @dataclass(frozen=True)
 class TrainerResults:
-    trainer_params_dict: Dict[str, Any]
+    trainer_params: TrainerParams
     num_labeled_train: int
     num_unlabeled_train: int
     num_valid: int
@@ -99,7 +103,7 @@ class TrainerResults:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            **self.trainer_params_dict,
+            **self.trainer_params.to_dict(),
             "num_labeled_train": self.num_labeled_train,
             "num_unlabeled_train": self.num_unlabeled_train,
             "num_valid": self.num_valid,
@@ -114,11 +118,23 @@ class TrainerResults:
 
 class Trainer(ABC):
     def __init__(
-        self, trainer_params: TrainerParams,
+        self, dataloader: DataloaderBase, trainer_params: TrainerParams,
     ):
         super().__init__()
+        if dataloader.dataset != trainer_params.dataset:
+            raise Exception(
+                "dataloader.dataset != trainer_params.dataset, {} != {}".format(
+                    dataloader.dataset.value, trainer_params.dataset.value
+                )
+            )
+        if dataloader.harmonize != trainer_params.harmonize:
+            raise Exception(
+                "dataloader.harmonize != trainer_params.harmonize, {} != {}".format(
+                    dataloader.harmonize, trainer_params.harmonize
+                )
+            )
+        self.dataloader = dataloader
         self.trainer_params = trainer_params
-        self.dataset = trainer_params.dataset
         self.__called = False
 
     def _set_called(self):
@@ -149,24 +165,44 @@ class Trainer(ABC):
         raise NotImplementedError
 
 
-class EDC_VAE_Trainer(Trainer):
-    @on_error(None, True)
-    def _run_single_seed_fold(
-        self, seed: int, fold: int, data_dict: Dict[str, Union[Data, int]]
-    ) -> TrainerResults:
+class SingleStageFrameworkTrainer(Trainer):
+    def run(self) -> TrainerResults:
+        self._set_called()
+
         seed_torch()
         device = get_device(self.trainer_params.device)
         verbose = self.trainer_params.verbose
 
         start = time.time()
+        data_dict = self.dataloader.load_split_data(
+            seed=self.trainer_params.seed,
+            fold=self.trainer_params.fold,
+            ssl=self.trainer_params.ssl,
+            validation=self.trainer_params.validation,
+            labeled_sites=self.trainer_params.labeled_sites,
+            unlabeled_sites=self.trainer_params.unlabeled_sites,
+            num_unlabeled=self.trainer_params.num_unlabeled,
+            num_process=self.trainer_params.dataloader_num_process,
+        )
+
         num_labeled_train = data_dict.get("num_labeled_train", 0)
         num_unlabeled_train = data_dict.get("num_unlabeled_train", 0)
-        num_valid = data_dict.get("num_test", 0)
-        baseline_accuracy = self._get_baseline_accuracy(data_dict.get("test"))
+        if self.trainer_params.validation:
+            num_valid = data_dict.get("num_valid", 0)
+            baseline_accuracy = self._get_baseline_accuracy(
+                data_dict.get("valid")
+            )
+        else:
+            num_valid = data_dict.get("num_test", 0)
+            baseline_accuracy = self._get_baseline_accuracy(
+                data_dict.get("test")
+            )
 
         self.trainer_params.model_params["input_size"] = data_dict["input_size"]
         self.trainer_params.model_params["num_sites"] = data_dict["num_sites"]
-        model = EDC_VAE(**self.trainer_params.model_params)
+        model = SingleStageFrameworkFactory.load_model(
+            self.trainer_params.model_name, self.trainer_params.model_params
+        )
         model_size = count_parameters(model)
         optimizer = model.get_optimizer(self.trainer_params.optim_params)
 
@@ -181,7 +217,7 @@ class EDC_VAE_Trainer(Trainer):
         save_model = self.trainer_params.save_model
         best_model_state_dict = None
 
-        epochs_log_path = self.trainer_params.epochs_log_path(seed, fold)
+        epochs_log_path = self.trainer_params.epochs_log_path
         mkdir(os.path.dirname(epochs_log_path))
         with open(epochs_log_path, "w") as f:
             f.write("")
@@ -196,11 +232,16 @@ class EDC_VAE_Trainer(Trainer):
                     optimizer,
                     self.trainer_params.hyperparameters,
                 )
-                valid_metrics = model.test_step(
-                    device, data_dict.get("test", None)
-                )
+                if self.trainer_params.validation:
+                    valid_metrics = model.test_step(
+                        device, data_dict.get("valid", None)
+                    )
+                else:
+                    valid_metrics = model.test_step(
+                        device, data_dict.get("test", None)
+                    )
             except Exception as e:
-                logging.error(e)
+                logging.error(e, exc_info=True)
             with open(epochs_log_path, "a") as f:
                 f.write(
                     json.dumps(
@@ -210,11 +251,6 @@ class EDC_VAE_Trainer(Trainer):
                     + "\n"
                 )
 
-            """
-            save priority:
-            1. accuracy
-            2. ce_loss
-            """
             save = valid_metrics["accuracy"] > best_metrics["accuracy"] or (
                 valid_metrics["accuracy"] == best_metrics["accuracy"]
                 and valid_metrics["ce_loss"] < best_metrics["ce_loss"]
@@ -237,7 +273,7 @@ class EDC_VAE_Trainer(Trainer):
 
         if save_model and best_model_state_dict is not None:
             try:
-                model_path = self.trainer_params.model_path(seed, fold)
+                model_path = self.trainer_params.model_path
                 mkdir(os.path.dirname(model_path))
                 torch.save(best_model_state_dict, model_path)
             except Exception as e:
@@ -248,7 +284,7 @@ class EDC_VAE_Trainer(Trainer):
 
         end = time.time()
         return TrainerResults(
-            trainer_params_dict=self.trainer_params.to_dict(seed, fold),
+            trainer_params=self.trainer_params,
             num_labeled_train=num_labeled_train,
             num_unlabeled_train=num_unlabeled_train,
             num_valid=num_valid,
@@ -259,35 +295,3 @@ class EDC_VAE_Trainer(Trainer):
             model_size=model_size,
             model_path=model_path,
         )
-
-    def run(self, results_csv_path: str) -> List[Dict[str, Any]]:
-        self._set_called()
-        all_seed_fold_results = list()
-
-        for seed in self.trainer_params.seeds:
-            data_dict_generator = self.dataset.load_split_data(
-                seed=seed,
-                num_fold=self.trainer_params.num_fold,
-                ssl=self.trainer_params.ssl,
-                labeled_sites=self.trainer_params.labeled_sites,
-            )
-
-            for fold, data_dict in enumerate(data_dict_generator):
-                fold_result: Optional[
-                    TrainerResults
-                ] = self._run_single_seed_fold(seed, fold, data_dict)
-                if fold_result is None:
-                    continue
-
-                all_seed_fold_results.append(fold_result.to_dict())
-                logging.info(
-                    "RESULT:\n{}".format(
-                        json.dumps(all_seed_fold_results[-1], indent=4)
-                    )
-                )
-
-                df = pd.DataFrame(all_seed_fold_results).dropna(how="all")
-                if not df.empty:
-                    df.to_csv(results_csv_path, index=False)
-
-        return all_seed_fold_results

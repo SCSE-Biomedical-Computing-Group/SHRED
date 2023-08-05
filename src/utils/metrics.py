@@ -3,6 +3,8 @@ import torch
 
 class ClassificationMetrics:
     """
+    https://www.labtestsonline.org.au/understanding/test-accuracy-and-reliability/how-reliable-is-pathology-testing
+
     Only for 2 class classification (diseased and controlled).
         - class 1 = diseased
         - class 0 = controlled
@@ -167,3 +169,86 @@ class ClassificationMetrics:
         fp = ((y_true == 0) & (y_pred == 1)).float().sum()
         fn = ((y_true == 1) & (y_pred == 0)).float().sum()
         return 2 * tp / (2 * tp + fp + fn)
+
+
+class CummulativeClassificationMetrics:
+    """
+    Only for 2 class classification (diseased and controlled).
+        - class 1 = diseased
+        - class 0 = controlled
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.tp = 0
+        self.tn = 0
+        self.fp = 0
+        self.fn = 0
+        self.total = 0
+
+    @staticmethod
+    def _check_y(y):
+        assert 1 <= y.ndim <= 2, "y.ndim must be 1 or 2, but given {}".format(
+            y.ndim
+        )
+        if y.ndim == 2:
+            assert (
+                y.size(1) == 2
+            ), "dim 1 of y must have size 2, but given size {}".format(
+                y.size(1)
+            )
+            y = y.argmax(dim=1)
+        elif y.ndim == 1:
+            assert torch.all((y == 0) | (y == 1)), "y can only contain 0 or 1"
+        return y
+
+    def update_batch(self, y_true, y_pred):
+        y_pred = self._check_y(y_pred)
+        y_true = self._check_y(y_true)
+        self.tp += ((y_true == 1) & (y_pred == 1)).float().sum()
+        self.tn += ((y_true == 0) & (y_pred == 0)).float().sum()
+        self.fp += ((y_true == 0) & (y_pred == 1)).float().sum()
+        self.fn += ((y_true == 1) & (y_pred == 0)).float().sum()
+        self.total += y_true.size(0)
+
+    @property
+    def accuracy(self) -> torch.Tensor:
+        return (self.tp + self.tn) / self.total
+
+    @property
+    def tnr(self) -> torch.Tensor:
+        return self.tn / (self.tn + self.fp)
+
+    @property
+    def tpr(self) -> torch.Tensor:
+        return self.tp / (self.tp + self.fn)
+
+    @property
+    def ppv(self) -> torch.Tensor:
+        return self.tp / (self.tp + self.fp)
+
+    @property
+    def npv(self) -> torch.Tensor:
+        return self.tn / (self.tn + self.fn)
+
+    @property
+    def fpr(self) -> torch.Tensor:
+        return self.fp / (self.tn + self.fp)
+
+    @property
+    def fnr(self) -> torch.Tensor:
+        return self.fn / (self.tp + self.fn)
+
+    @property
+    def fdr(self) -> torch.Tensor:
+        return self.fp / (self.tp + self.fp)
+
+    @property
+    def fomr(self) -> torch.Tensor:
+        return self.fn / (self.tn + self.fn)
+
+    @property
+    def f1_score(self) -> torch.Tensor:
+        return 2 * self.tp / (2 * self.tp + self.fp + self.fn)

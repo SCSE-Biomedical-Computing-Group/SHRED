@@ -1,0 +1,43 @@
+seed:
+  min: 0
+  max: 10
+fold:
+  min: 0
+  max: 5
+model:
+  -
+    model_name: FFN
+    model_params:
+      hidden_1: 75
+      hidden_2: 50
+      hidden_3: 30
+      dropout: 0.5
+    optim_params:
+      lr: 0.0001
+      l2_reg: 0.001
+data:
+  -
+    output_directory: ../.archive/Schiz_INDIVIDUAL
+    dataset: Schiz
+    labeled_sites:
+      - h
+      - nmorph
+      - ucla
+      - cobre
+experiment_settings:
+  -
+    ssl: false
+    harmonize: false
+    validation: false
+  -
+    ssl: false
+    harmonize: true
+    validation: false
+process:
+  device: 3
+  verbose: false
+  max_epoch: 1000
+  patience: 1000
+  save_model_condition:
+    -
+      dataset: Schiz
